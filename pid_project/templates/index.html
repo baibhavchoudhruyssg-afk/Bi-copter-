@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bicopter Single-Axis Control Bench</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e2e; color: #cdd6f4; margin: 0; padding: 20px; display: grid; grid-template-columns: 1fr 350px; gap: 20px; height: 100vh; box-sizing: border-box; }
+        h1, h2, h3 { color: #89b4fa; margin-top: 0; }
+        .panel { background-color: #313244; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); margin-bottom: 20px; }
+        #canvas-container { width: 100%; height: 100%; border-radius: 10px; overflow: hidden; background: #181825; box-shadow: inset 0 0 10px rgba(0,0,0,0.5); }
+        .control-group { margin-bottom: 15px; }
+        .control-group label { display: flex; justify-content: space-between; margin-bottom: 5px; font-weight: bold; }
+        input[type="range"] { width: 100%; cursor: pointer; }
+        .switch { position: relative; display: inline-block; width: 60px; height: 34px; margin-top: 10px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #f38ba8; transition: .4s; border-radius: 34px; }
+        .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: #a6e3a1; }
+        input:checked + .slider:before { transform: translateX(26px); }
+        .diag-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-family: monospace; font-size: 14px; }
+        .diag-box { background: #1e1e2e; padding: 10px; border-radius: 5px; border-left: 4px solid #89b4fa; }
+        .val { display: block; font-size: 18px; font-weight: bold; color: #f9e2af; margin-top: 5px; }
+        .kalman-desc { font-size: 0.85em; color: #a6adc8; margin-bottom: 10px; line-height: 1.4; }
+    </style>
+</head>
+<body>
+
+    <div style="display: flex; flex-direction: column;">
+        <h1>Bicopter Bench</h1>
+        <div id="canvas-container"></div>
+    </div>
+
+    <div style="overflow-y: auto; padding-right: 5px;">
+        <div class="panel">
+            <h2>Control Panel</h2>
+            <div class="control-group">
+                <label>Target Angle <span id="target-val">0°</span></label>
+                <input type="range" id="target" min="-45" max="45" value="0" step="1">
+            </div>
+            <div class="control-group">
+                <label>Proportional (P) <span id="p-val">1.5</span></label>
+                <input type="range" id="kp" min="0" max="5" value="1.5" step="0.1">
+            </div>
+            <div class="control-group">
+                <label>Integral (I) <span id="i-val">0.01</span></label>
+                <input type="range" id="ki" min="0" max="0.5" value="0.01" step="0.01">
+            </div>
+            <div class="control-group">
+                <label>Derivative (D) <span id="d-val">0.5</span></label>
+                <input type="range" id="kd" min="0" max="5" value="0.5" step="0.1">
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Filter Settings</h2>
+            <div class="kalman-desc">
+                The Kalman filter mathematically merges noisy accelerometer data with smooth gyroscope physics to prevent the D-term from reacting to random sensor jitter.
+            </div>
+            <label style="display: flex; align-items: center; justify-content: space-between; font-weight: bold;">
+                <span id="mode-text" style="color: #f38ba8;">Raw Sensor Mode</span>
+                <label class="switch">
+                    <input type="checkbox" id="kalman-toggle">
+                    <span class="slider"></span>
+                </label>
+            </label>
+        </div>
+
+        <div class="panel">
+            <h2>Diagnostics</h2>
+            <div class="diag-grid">
+                <div class="diag-box">True Angle <span class="val" id="diag-true">0.0°</span></div>
+                <div class="diag-box">Sensor (Raw) <span class="val" id="diag-sensor">0.0°</span></div>
+                <div class="diag-box">Error <span class="val" id="diag-error">0.0°</span></div>
+                <div class="diag-box">Filtered <span class="val" id="diag-filtered">0.0°</span></div>
+                <div class="diag-box" style="border-color: #f38ba8;">L Motor PWM <span class="val" id="diag-ml">1500</span></div>
+                <div class="diag-box" style="border-color: #a6e3a1;">R Motor PWM <span class="val" id="diag-mr">1500</span></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- 1. WebSocket Setup ---
+        const socket = io();
+
+        // Send UI changes to backend
+        function sendUpdates() {
+            const data = {
+                target_angle: parseFloat(document.getElementById('target').value),
+                kp: parseFloat(document.getElementById('kp').value),
+                ki: parseFloat(document.getElementById('ki').value),
+                kd: parseFloat(document.getElementById('kd').value),
+                use_kalman: document.getElementById('kalman-toggle').checked
+            };
+            socket.emit('update_controls', data);
+        }
+
+        // Attach listeners to UI elements
+        ['target', 'kp', 'ki', 'kd'].forEach(id => {
+            document.getElementById(id).addEventListener('input', (e) => {
+                document.getElementById(`${id.replace('k', '')}-val`).innerText = id === 'target' ? e.target.value + '°' : e.target.value;
+                sendUpdates();
+            });
+        });
+
+        document.getElementById('kalman-toggle').addEventListener('change', (e) => {
+            const textSpan = document.getElementById('mode-text');
+            if(e.target.checked) {
+                textSpan.innerText = "Kalman Filter ON";
+                textSpan.style.color = "#a6e3a1";
+            } else {
+                textSpan.innerText = "Raw Sensor Mode";
+                textSpan.style.color = "#f38ba8";
+            }
+            sendUpdates();
+        });
+
+        // --- 2. Three.js Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        container.appendChild(renderer.domElement);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        // Build Bicopter Model (Pivot group)
+        const bicopter = new THREE.Group();
+        
+        // Main Arm
+        const armGeo = new THREE.CylinderGeometry(0.2, 0.2, 10, 32);
+        const armMat = new THREE.MeshPhongMaterial({ color: 0x89b4fa });
+        const arm = new THREE.Mesh(armGeo, armMat);
+        arm.rotation.z = Math.PI / 2; // Lay flat
+        bicopter.add(arm);
+
+        // Motors (Left & Right)
+        const motorGeo = new THREE.CylinderGeometry(0.5, 0.5, 1, 32);
+        const motorMatL = new THREE.MeshPhongMaterial({ color: 0xf38ba8 }); // Red left
+        const motorMatR = new THREE.MeshPhongMaterial({ color: 0xa6e3a1 }); // Green right
+        
+        const motorL = new THREE.Mesh(motorGeo, motorMatL);
+        motorL.position.set(-5, 0.6, 0);
+        bicopter.add(motorL);
+
+        const motorR = new THREE.Mesh(motorGeo, motorMatR);
+        motorR.position.set(5, 0.6, 0);
+        bicopter.add(motorR);
+
+        // Center Stand (Static)
+        const standGeo = new THREE.CylinderGeometry(0.3, 0.5, 6, 32);
+        const standMat = new THREE.MeshPhongMaterial({ color: 0x45475a });
+        const stand = new THREE.Mesh(standGeo, standMat);
+        stand.position.y = -3;
+        scene.add(stand);
+
+        scene.add(bicopter);
+        camera.position.set(0, 5, 15);
+        camera.lookAt(0, 0, 0);
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = container.clientWidth / container.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+        });
+
+        // --- 3. Telemetry Handling & Animation ---
+        let currentTrueAngle = 0;
+
+        socket.on('telemetry', (data) => {
+            // Update 3D Model rotation (Convert degrees to radians)
+            // Negative sign depends on your convention, here we apply it to map logically
+            currentTrueAngle = -data.true_angle * (Math.PI / 180); 
+
+            // Update Diagnostics UI
+            document.getElementById('diag-true').innerText = data.true_angle.toFixed(1) + '°';
+            document.getElementById('diag-sensor').innerText = data.sensor_reading.toFixed(1) + '°';
+            document.getElementById('diag-filtered').innerText = data.filtered_reading.toFixed(1) + '°';
+            document.getElementById('diag-error').innerText = data.error.toFixed(1) + '°';
+            document.getElementById('diag-ml').innerText = data.motor_left;
+            document.getElementById('diag-mr').innerText = data.motor_right;
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            // Smoothly interpolate rotation for visual stability between network updates
+            bicopter.rotation.z += (currentTrueAngle - bicopter.rotation.z) * 0.2;
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
